@@ -1,10 +1,14 @@
 """Stream resolution API routes"""
 
+import asyncio
+import hashlib
+import uuid
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import RedirectResponse
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_db
@@ -16,6 +20,38 @@ from ..services.stremio_service import StremioService
 from ..services.tmdb_service import TMDBService
 
 router = APIRouter(prefix="/api/stream", tags=["stream"])
+
+# In-memory store for resolved stream URLs (session-based)
+# Maps session_id -> {"url": stream_url, "created": timestamp}
+_stream_sessions: dict = {}
+
+# Session timeout in seconds (1 hour)
+SESSION_TIMEOUT = 3600
+
+# Maximum concurrent streams (configurable)
+MAX_CONCURRENT_STREAMS = 10
+
+# Track active stream count
+_active_streams = 0
+_stream_lock = asyncio.Lock()
+
+
+def generate_session_id(media_type: str, tmdb_id: int, quality: str, season: int = None, episode: int = None) -> str:
+    """Generate a unique session ID for a stream"""
+    data = f"{media_type}:{tmdb_id}:{quality}:{season}:{episode}:{uuid.uuid4().hex[:8]}"
+    return hashlib.sha256(data.encode()).hexdigest()[:16]
+
+
+def cleanup_expired_sessions() -> int:
+    """Remove expired sessions from memory"""
+    now = datetime.utcnow().timestamp()
+    expired = [
+        sid for sid, data in _stream_sessions.items()
+        if now - data["created"] > SESSION_TIMEOUT
+    ]
+    for sid in expired:
+        del _stream_sessions[sid]
+    return len(expired)
 
 
 @router.get("/resolve/{media_type}/{tmdb_id}")
@@ -146,7 +182,24 @@ async def resolve_stream(
             f"Resolved {state_key} quality={quality} index={use_index} attempt={state.attempt_count} → {stream_url[:100]}..."
         )
 
-        return RedirectResponse(url=stream_url, status_code=302)
+        # Generate session ID and store stream URL for proxying
+        session_id = generate_session_id(media_type, tmdb_id, quality, season, episode)
+        _stream_sessions[session_id] = {
+            "url": stream_url,
+            "created": datetime.utcnow().timestamp()
+        }
+        
+        # Cleanup old sessions occasionally
+        if len(_stream_sessions) > 100:
+            cleaned = cleanup_expired_sessions()
+            if cleaned > 0:
+                log_service.info(f"Cleaned up {cleaned} expired stream sessions")
+        
+        # Return proxy URL instead of direct redirect
+        proxy_url = f"/api/stream/proxy/{session_id}"
+        log_service.info(f"Created proxy session {session_id} -> {stream_url[:50]}...")
+        
+        return RedirectResponse(url=proxy_url, status_code=302)
 
     except HTTPException:
         raise
@@ -159,3 +212,94 @@ async def resolve_stream(
         if tmdb:
             await tmdb.close()
         await stremio.close()
+
+
+@router.get("/proxy/{session_id}")
+async def proxy_stream(session_id: str, request: Request):
+    """
+    Proxy endpoint that fetches the stream from debrid and forwards it to Jellyfin.
+    This hides the debrid service URL from Jellyfin.
+    Supports multiple concurrent streams.
+    """
+    # Check concurrent stream limit
+    global _active_streams
+    async with _stream_lock:
+        if _active_streams >= MAX_CONCURRENT_STREAMS:
+            log_service.error(f"Max concurrent streams ({MAX_CONCURRENT_STREAMS}) reached")
+            raise HTTPException(
+                status_code=503, 
+                detail=f"Server busy - max {MAX_CONCURRENT_STREAMS} concurrent streams allowed"
+            )
+        _active_streams += 1
+    
+    # Look up the stored stream URL
+    session_data = _stream_sessions.get(session_id)
+    
+    if not session_data:
+        async with _stream_lock:
+            _active_streams -= 1
+        log_service.error(f"Invalid or expired session: {session_id}")
+        raise HTTPException(status_code=404, detail="Session expired or invalid")
+    
+    stream_url = session_data["url"]
+    
+    log_service.info(f"Proxying stream for session {session_id} (active: {_active_streams})")
+    log_service.stream(f"Proxying: {stream_url[:80]}...")
+    
+    try:
+        # Forward headers (except host)
+        headers = {}
+        for key, value in request.headers.items():
+            if key.lower() != "host":
+                headers[key] = value
+        
+        # Use streaming HTTP client to fetch and forward content
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(3600.0),  # 1 hour timeout for large files
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
+        ) as client:
+            # Make request to get headers first
+            response = await client.get(stream_url, headers=headers, stream=True)
+            
+            # Get content type and other headers from upstream
+            content_type = response.headers.get("content-type", "application/octet-stream")
+            content_length = response.headers.get("content-length")
+            
+            log_service.info(f"Proxy stream started: {content_type}, length: {content_length}")
+            
+            # Stream the content back to the client
+            async def content_generator():
+                try:
+                    async for chunk in response.aiter_bytes(chunk_size=8192):
+                        yield chunk
+                finally:
+                    # Clean up session after streaming completes
+                    if session_id in _stream_sessions:
+                        del _stream_sessions[session_id]
+                    async with _stream_lock:
+                        _active_streams -= 1
+                    log_service.info(f"Stream session {session_id} ended (active: {_active_streams})")
+            
+            # Filter headers - exclude content-length for streaming
+            response_headers = {}
+            for key, value in response.headers.items():
+                if key.lower() not in ("content-length", "transfer-encoding", "connection"):
+                    response_headers[key] = value
+            
+            return StreamingResponse(
+                content_generator(),
+                media_type=content_type,
+                headers=response_headers
+            )
+            
+    except httpx.HTTPError as e:
+        async with _stream_lock:
+            _active_streams -= 1
+        log_service.error(f"HTTP error proxying stream: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to fetch stream: {str(e)}")
+    except Exception as e:
+        async with _stream_lock:
+            _active_streams -= 1
+        log_service.error(f"Error proxying stream: {e}")
+        raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
