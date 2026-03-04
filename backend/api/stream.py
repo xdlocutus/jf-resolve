@@ -41,14 +41,25 @@ def _forward_headers(request: Request, exclude: tuple = ("host",)) -> dict:
 
 
 async def _proxy_head(stream_url: str, request: Request) -> Response:
-    """HEAD upstream and return its status/headers (transparent)."""
-    headers = _forward_headers(request)
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        resp = await client.head(stream_url, headers=headers)
-    out = {k: v for k, v in resp.headers.items() if k.lower() not in ("transfer-encoding", "connection")}
-    if not any(k.lower() == "accept-ranges" for k in out):
-        out["Accept-Ranges"] = "bytes"
-    return Response(status_code=resp.status_code, headers=out)
+    """HEAD upstream and return its status/headers (transparent). On error, return safe 200."""
+    try:
+        headers = _forward_headers(request)
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            resp = await client.head(stream_url, headers=headers)
+        out = {}
+        for k, v in resp.headers.items():
+            if k.lower() in ("transfer-encoding", "connection"):
+                continue
+            out[k] = v if isinstance(v, str) else str(v)
+        if not any(k.lower() == "accept-ranges" for k in out):
+            out["Accept-Ranges"] = "bytes"
+        return Response(status_code=resp.status_code, headers=out)
+    except Exception as e:
+        log_service.error(f"HEAD upstream failed: {e}")
+        return Response(
+            status_code=200,
+            headers={"Accept-Ranges": "bytes", "Content-Type": "application/octet-stream"},
+        )
 
 
 def generate_session_id(
@@ -113,10 +124,15 @@ async def resolve_stream(
             _active_streams += 1
         try:
             return await _build_stream_response(stream_url, request, session_id)
-        except Exception:
+        except HTTPException:
             async with _stream_lock:
                 _active_streams -= 1
             raise
+        except Exception as e:
+            async with _stream_lock:
+                _active_streams -= 1
+            log_service.error(f"Stream proxy error: {e}")
+            raise HTTPException(status_code=502, detail=f"Stream error: {str(e)}")
 
     if request.method == "HEAD":
         return Response(status_code=200, headers={"Accept-Ranges": "bytes", "Content-Type": "application/octet-stream"})
@@ -245,10 +261,15 @@ async def resolve_stream(
             _active_streams += 1
         try:
             return await _build_stream_response(stream_url, request, session_id)
-        except Exception:
+        except HTTPException:
             async with _stream_lock:
                 _active_streams -= 1
             raise
+        except Exception as e:
+            async with _stream_lock:
+                _active_streams -= 1
+            log_service.error(f"Stream proxy error: {e}")
+            raise HTTPException(status_code=502, detail=f"Stream error: {str(e)}")
 
     except HTTPException:
         raise
