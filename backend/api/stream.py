@@ -321,7 +321,7 @@ async def proxy_stream(session_id: str, request: Request):
     log_service.stream(f"Proxying: {stream_url[:80]}...")
     
     try:
-        # Forward headers (except host); ensure values are strings for httpx
+        # Forward request headers (except host) so Range is sent for seek; all traffic via your network
         headers = {}
         for key, value in request.headers.items():
             if key.lower() == "host":
@@ -337,7 +337,6 @@ async def proxy_stream(session_id: str, request: Request):
             follow_redirects=True,
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
         ) as client:
-            # Mutable container for headers (filled when generator starts streaming)
             meta = {
                 "content_type": "application/octet-stream",
                 "response_headers": {},
@@ -354,6 +353,7 @@ async def proxy_stream(session_id: str, request: Request):
                         meta["content_type"] = response.headers.get(
                             "content-type", "application/octet-stream"
                         )
+                        # Pass through Content-Range for 206 (seek); omit length/encoding/connection
                         meta["response_headers"] = {
                             k: v
                             for k, v in response.headers.items()
@@ -363,7 +363,6 @@ async def proxy_stream(session_id: str, request: Request):
                                 "connection",
                             )
                         }
-                        # Let players (VLC, Jellyfin) know we support range requests
                         if not any(k.lower() == "accept-ranges" for k in meta["response_headers"]):
                             meta["response_headers"]["Accept-Ranges"] = "bytes"
                         content_length = response.headers.get("content-length")
