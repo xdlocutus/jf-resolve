@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import Optional
 
 import httpx
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
