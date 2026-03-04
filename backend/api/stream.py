@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import sys
 import traceback
-import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -43,9 +42,16 @@ _stream_lock = asyncio.Lock()
 _internal_api_secret = getattr(settings, 'INTERNAL_API_SECRET', 'jf-resolve-internal-2024')
 
 
-def generate_session_id(media_type: str, tmdb_id: int, quality: str, season: int = None, episode: int = None) -> str:
-    """Generate a unique session ID for a stream"""
-    data = f"{media_type}:{tmdb_id}:{quality}:{season}:{episode}:{uuid.uuid4().hex[:8]}"
+def generate_session_id(
+    media_type: str,
+    tmdb_id: int,
+    quality: str,
+    season: int = None,
+    episode: int = None,
+    index: int = 0,
+) -> str:
+    """Generate a deterministic session ID so the same media reuses the same proxy URL."""
+    data = f"{media_type}:{tmdb_id}:{quality}:{season}:{episode}:{index}"
     return hashlib.sha256(data.encode()).hexdigest()[:16]
 
 
@@ -88,6 +94,14 @@ async def resolve_stream(
         raise HTTPException(
             status_code=400, detail="Season and episode required for TV shows"
         )
+
+    # Reuse existing session for same media so Emby/Jellyfin range requests get the same proxy URL
+    session_id = generate_session_id(media_type, tmdb_id, quality, season, episode, index)
+    existing = _stream_sessions.get(session_id)
+    if existing and (datetime.utcnow().timestamp() - existing["created"]) < SESSION_TIMEOUT:
+        proxy_url = f"/api/stream/proxy/{session_id}"
+        log_service.info(f"Reusing proxy session {session_id} for {media_type}/{tmdb_id}")
+        return RedirectResponse(url=proxy_url, status_code=302)
 
     settings = SettingsManager(db)
     await settings.load_cache()
@@ -189,8 +203,8 @@ async def resolve_stream(
             f"Resolved {state_key} quality={quality} index={use_index} attempt={state.attempt_count} → {stream_url[:100]}..."
         )
 
-        # Generate session ID and store stream URL for proxying
-        session_id = generate_session_id(media_type, tmdb_id, quality, season, episode)
+        # Generate session ID and store stream URL for proxying (same id as early-check for reuse)
+        session_id = generate_session_id(media_type, tmdb_id, quality, season, episode, index)
         _stream_sessions[session_id] = {
             "url": stream_url,
             "created": datetime.utcnow().timestamp()
