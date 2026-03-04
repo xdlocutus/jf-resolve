@@ -4,12 +4,13 @@ import asyncio
 import hashlib
 import sys
 import traceback
+from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
@@ -40,6 +41,64 @@ _stream_lock = asyncio.Lock()
 # Shared secret for internal API calls between servers
 # Use getattr to avoid issues at import time
 _internal_api_secret = getattr(settings, 'INTERNAL_API_SECRET', 'jf-resolve-internal-2024')
+
+# Locks for "stream + cache" per session so only one download populates cache
+_download_locks: dict = {}
+_download_locks_lock = asyncio.Lock()
+
+
+def _cache_path(session_id: str) -> Path:
+    """Path to cached stream file."""
+    settings.STREAM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return settings.STREAM_CACHE_DIR / f"{session_id}.stream"
+
+
+def _cache_meta_path(session_id: str) -> Path:
+    """Path to cache meta file (size + content_type)."""
+    return settings.STREAM_CACHE_DIR / f"{session_id}.meta"
+
+
+def _is_cache_complete(session_id: str) -> bool:
+    """True if we have a complete cached file for this session."""
+    path = _cache_path(session_id)
+    meta = _cache_meta_path(session_id)
+    return path.exists() and meta.exists()
+
+
+def _read_cache_meta(session_id: str) -> Tuple[int, str]:
+    """Return (size_bytes, content_type) from .meta file."""
+    meta = _cache_meta_path(session_id)
+    if not meta.exists():
+        return 0, "application/octet-stream"
+    lines = meta.read_text().strip().split("\n")
+    size = int(lines[0]) if lines else 0
+    content_type = lines[1].strip() if len(lines) > 1 else "application/octet-stream"
+    return size, content_type
+
+
+async def _download_lock(session_id: str) -> asyncio.Lock:
+    """Get or create a lock for this session (for stream+cache)."""
+    async with _download_locks_lock:
+        if session_id not in _download_locks:
+            _download_locks[session_id] = asyncio.Lock()
+        return _download_locks[session_id]
+
+
+def _serve_from_cache(session_id: str):
+    """
+    Return FileResponse for cached stream if complete; supports Range (seek).
+    Returns None if cache not complete.
+    """
+    if not _is_cache_complete(session_id):
+        return None
+    path = _cache_path(session_id)
+    _, content_type = _read_cache_meta(session_id)
+    log_service.info(f"Serving from cache: {session_id} ({path.stat().st_size} bytes)")
+    return FileResponse(
+        path=str(path),
+        media_type=content_type,
+        filename=None,
+    )
 
 
 def generate_session_id(
@@ -97,25 +156,39 @@ async def resolve_stream(
             status_code=400, detail="Season and episode required for TV shows"
         )
 
-    # Reuse existing session for same media; stream directly (no redirect) so Emby/players get the stream
     session_id = generate_session_id(media_type, tmdb_id, quality, season, episode, index)
-    existing = _stream_sessions.get(session_id)
-    if existing and (datetime.utcnow().timestamp() - existing["created"]) < SESSION_TIMEOUT:
-        stream_url = existing["url"]
-        log_service.info(f"Streaming from existing session {session_id} for {media_type}/{tmdb_id}")
-        async with _stream_lock:
-            if _active_streams >= MAX_CONCURRENT_STREAMS:
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Server busy - max {MAX_CONCURRENT_STREAMS} concurrent streams allowed",
-                )
-            _active_streams += 1
-        try:
-            return await _build_stream_response(stream_url, request, session_id)
-        except Exception:
+
+    # 1) Serve from cache if complete (supports Range/seek; Emby-friendly)
+    cached = _serve_from_cache(session_id)
+    if cached is not None:
+        return cached
+
+    # 2) One download per session: acquire lock, then recheck cache (another request may have filled it)
+    lock = await _download_lock(session_id)
+    async with lock:
+        cached = _serve_from_cache(session_id)
+        if cached is not None:
+            return cached
+
+        existing = _stream_sessions.get(session_id)
+        if existing and (datetime.utcnow().timestamp() - existing["created"]) < SESSION_TIMEOUT:
+            stream_url = existing["url"]
+            log_service.info(f"Streaming + caching from session {session_id} for {media_type}/{tmdb_id}")
             async with _stream_lock:
-                _active_streams -= 1
-            raise
+                if _active_streams >= MAX_CONCURRENT_STREAMS:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Server busy - max {MAX_CONCURRENT_STREAMS} concurrent streams allowed",
+                    )
+                _active_streams += 1
+            try:
+                return await _build_stream_response(
+                    stream_url, request, session_id, cache_path=_cache_path(session_id)
+                )
+            except Exception:
+                async with _stream_lock:
+                    _active_streams -= 1
+                raise
 
     settings = SettingsManager(db)
     await settings.load_cache()
@@ -230,20 +303,27 @@ async def resolve_stream(
             if cleaned > 0:
                 log_service.info(f"Cleaned up {cleaned} expired stream sessions")
 
-        log_service.info(f"Streaming from new session {session_id} -> {stream_url[:50]}...")
-        async with _stream_lock:
-            if _active_streams >= MAX_CONCURRENT_STREAMS:
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Server busy - max {MAX_CONCURRENT_STREAMS} concurrent streams allowed",
-                )
-            _active_streams += 1
-        try:
-            return await _build_stream_response(stream_url, request, session_id)
-        except Exception:
+        lock = await _download_lock(session_id)
+        async with lock:
+            cached = _serve_from_cache(session_id)
+            if cached is not None:
+                return cached
+            log_service.info(f"Streaming + caching new session {session_id} -> {stream_url[:50]}...")
             async with _stream_lock:
-                _active_streams -= 1
-            raise
+                if _active_streams >= MAX_CONCURRENT_STREAMS:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Server busy - max {MAX_CONCURRENT_STREAMS} concurrent streams allowed",
+                    )
+                _active_streams += 1
+            try:
+                return await _build_stream_response(
+                    stream_url, request, session_id, cache_path=_cache_path(session_id)
+                )
+            except Exception:
+                async with _stream_lock:
+                    _active_streams -= 1
+                raise
 
     except HTTPException:
         raise
@@ -259,12 +339,15 @@ async def resolve_stream(
 
 
 async def _build_stream_response(
-    stream_url: str, request: Request, session_id: str
+    stream_url: str,
+    request: Request,
+    session_id: str,
+    cache_path: Optional[Path] = None,
 ) -> StreamingResponse:
     """
-    Stream from upstream URL and return StreamingResponse.
+    Stream from upstream; optionally write to cache_path as we go.
+    When cache_path is set, we write each chunk to file and write .meta when done (enables seek later).
     Caller must increment _active_streams before calling; generator finally decrements when stream_started.
-    Always 200 OK, no Range forwarded - full stream from start for maximum Emby/player compatibility.
     """
     headers = {}
     for key, value in request.headers.items():
@@ -282,11 +365,16 @@ async def _build_stream_response(
             "content_type": "application/octet-stream",
             "response_headers": {},
         }
+        meta_path = _cache_meta_path(session_id) if cache_path else None
 
         async def content_generator():
             global _active_streams
             stream_started = False
+            cache_file = None
+            bytes_written = 0
             try:
+                if cache_path:
+                    cache_file = open(cache_path, "wb")
                 async with client.stream("GET", stream_url, headers=headers) as response:
                     response.raise_for_status()
                     meta["content_type"] = response.headers.get(
@@ -309,10 +397,25 @@ async def _build_stream_response(
                     try:
                         async for chunk in response.aiter_bytes(chunk_size=8192):
                             stream_started = True
+                            if cache_file:
+                                cache_file.write(chunk)
+                                bytes_written += len(chunk)
                             yield chunk
                     except httpx.ReadError as e:
                         log_service.error(f"Upstream read error while streaming: {e}")
             finally:
+                if cache_file:
+                    try:
+                        cache_file.close()
+                        if meta_path and bytes_written > 0:
+                            meta_path.write_text(
+                                f"{bytes_written}\n{meta['content_type']}\n"
+                            )
+                            log_service.info(
+                                f"Cached stream {session_id} ({bytes_written} bytes)"
+                            )
+                    except Exception as e:
+                        log_service.error(f"Cache write error: {e}")
                 if stream_started:
                     async with _stream_lock:
                         _active_streams -= 1
@@ -365,11 +468,14 @@ async def get_stream_url(session_id: str, secret: str = Query(...)):
 async def proxy_stream(session_id: str, request: Request):
     """
     Proxy endpoint that fetches the stream from debrid and forwards it to Jellyfin.
-    This hides the debrid service URL from Jellyfin.
-    Supports multiple concurrent streams.
+    Serves from local cache when available (supports Range/seek).
     """
     log_service.info(f"[PROXY] Starting proxy for session {session_id}")
-    
+
+    cached = _serve_from_cache(session_id)
+    if cached is not None:
+        return cached
+
     # Check concurrent stream limit
     global _active_streams
     async with _stream_lock:
@@ -426,22 +532,29 @@ async def proxy_stream(session_id: str, request: Request):
     log_service.info(f"Proxying stream for session {session_id} (active: {_active_streams})")
     log_service.stream(f"Proxying: {stream_url[:80]}...")
 
-    try:
-        return await _build_stream_response(stream_url, request, session_id)
-    except httpx.HTTPError as e:
-        async with _stream_lock:
-            _active_streams -= 1
-        msg = f"HTTP error proxying stream: {e}"
-        log_service.error(msg)
-        log_service.error(traceback.format_exc())
-        print(f"[PROXY ERROR] {msg}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
-        raise HTTPException(status_code=502, detail=f"Failed to fetch stream: {str(e)}")
-    except Exception as e:
-        async with _stream_lock:
-            _active_streams -= 1
-        msg = f"Error proxying stream: {type(e).__name__}: {e}"
-        log_service.error(msg)
-        log_service.error(f"Stream URL (first 120 chars): {stream_url[:120] if stream_url else 'N/A'}")
-        log_service.error(traceback.format_exc())
-        print(f"[PROXY ERROR] {msg}\nStream URL: {stream_url[:120] if stream_url else 'N/A'}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
-        raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
+    lock = await _download_lock(session_id)
+    async with lock:
+        cached = _serve_from_cache(session_id)
+        if cached is not None:
+            return cached
+        try:
+            return await _build_stream_response(
+                stream_url, request, session_id, cache_path=_cache_path(session_id)
+            )
+        except httpx.HTTPError as e:
+            async with _stream_lock:
+                _active_streams -= 1
+            msg = f"HTTP error proxying stream: {e}"
+            log_service.error(msg)
+            log_service.error(traceback.format_exc())
+            print(f"[PROXY ERROR] {msg}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
+            raise HTTPException(status_code=502, detail=f"Failed to fetch stream: {str(e)}")
+        except Exception as e:
+            async with _stream_lock:
+                _active_streams -= 1
+            msg = f"Error proxying stream: {type(e).__name__}: {e}"
+            log_service.error(msg)
+            log_service.error(f"Stream URL (first 120 chars): {stream_url[:120] if stream_url else 'N/A'}")
+            log_service.error(traceback.format_exc())
+            print(f"[PROXY ERROR] {msg}\nStream URL: {stream_url[:120] if stream_url else 'N/A'}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
+            raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")

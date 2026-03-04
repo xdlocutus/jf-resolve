@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     # Directories
     BASE_DIR: Path = Path(__file__).parent.parent
     DATA_DIR: Path = BASE_DIR / "data"
+    STREAM_CACHE_DIR: Path = DATA_DIR / "stream_cache"
     LOGS_DIR: Path = DATA_DIR / "logs"
     TEMPLATES_DIR: Path = BASE_DIR / "templates"
     STATIC_DIR: Path = BASE_DIR / "static"
@@ -50,6 +51,7 @@ class Settings(BaseSettings):
         super().__init__(**kwargs)
         # Ensure directories exist
         self.DATA_DIR.mkdir(exist_ok=True)
+        self.STREAM_CACHE_DIR.mkdir(exist_ok=True)
         self.LOGS_DIR.mkdir(exist_ok=True)
 
 
