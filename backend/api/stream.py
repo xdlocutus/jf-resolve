@@ -6,7 +6,6 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,7 +17,6 @@ from ..services.log_service import log_service
 from ..services.settings_manager import SettingsManager
 from ..services.stremio_service import StremioService
 from ..services.tmdb_service import TMDBService
-from ..config import settings
 
 router = APIRouter(prefix="/api/stream", tags=["stream"])
 
@@ -259,6 +257,9 @@ async def proxy_stream(session_id: str, request: Request):
     # Try to get session from local storage first
     session_data = _stream_sessions.get(session_id)
     
+    log_service.info(f"Looking up session {session_id}, found: {session_data is not None}")
+    log_service.info(f"Available sessions: {list(_stream_sessions.keys())[:5]}...")  # Show first 5
+    
     # If not found locally, try to fetch from main server (for stream server)
     if not session_data and settings.JFRESOLVE_SERVER_URL:
         try:
@@ -291,6 +292,8 @@ async def proxy_stream(session_id: str, request: Request):
         for key, value in request.headers.items():
             if key.lower() != "host":
                 headers[key] = value
+        
+        log_service.info(f"Fetching stream from: {stream_url[:100]}...")
         
         # Use streaming HTTP client to fetch and forward content
         async with httpx.AsyncClient(
@@ -336,9 +339,13 @@ async def proxy_stream(session_id: str, request: Request):
         async with _stream_lock:
             _active_streams -= 1
         log_service.error(f"HTTP error proxying stream: {e}")
+        import traceback
+        log_service.error(traceback.format_exc())
         raise HTTPException(status_code=502, detail=f"Failed to fetch stream: {str(e)}")
     except Exception as e:
         async with _stream_lock:
             _active_streams -= 1
         log_service.error(f"Error proxying stream: {e}")
+        import traceback
+        log_service.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
