@@ -287,17 +287,31 @@ async def proxy_stream(session_id: str, request: Request):
         log_service.error(f"Invalid or expired session: {session_id}")
         raise HTTPException(status_code=404, detail="Session expired or invalid")
     
-    stream_url = session_data["url"]
+    stream_url = session_data.get("url")
+    if not stream_url or not isinstance(stream_url, str):
+        async with _stream_lock:
+            _active_streams -= 1
+        log_service.error(f"Invalid stream URL in session {session_id}: {type(stream_url).__name__}")
+        raise HTTPException(status_code=502, detail="Invalid stream URL in session")
+    
+    stream_url = stream_url.strip()
+    if not stream_url.lower().startswith(("http://", "https://")):
+        async with _stream_lock:
+            _active_streams -= 1
+        log_service.error(f"Stream URL is not absolute: {stream_url[:80]}...")
+        raise HTTPException(status_code=502, detail="Stream URL must be http(s)")
     
     log_service.info(f"Proxying stream for session {session_id} (active: {_active_streams})")
     log_service.stream(f"Proxying: {stream_url[:80]}...")
     
     try:
-        # Forward headers (except host)
+        # Forward headers (except host); ensure values are strings for httpx
         headers = {}
         for key, value in request.headers.items():
-            if key.lower() != "host":
-                headers[key] = value
+            if key.lower() == "host":
+                continue
+            if value is not None:
+                headers[key] = value if isinstance(value, str) else str(value)
         
         log_service.info(f"Fetching stream from: {stream_url[:100]}...")
         
@@ -351,7 +365,8 @@ async def proxy_stream(session_id: str, request: Request):
     except Exception as e:
         async with _stream_lock:
             _active_streams -= 1
-        log_service.error(f"Error proxying stream: {e}")
         import traceback
+        log_service.error(f"Error proxying stream: {type(e).__name__}: {e}")
+        log_service.error(f"Stream URL (first 120 chars): {stream_url[:120] if stream_url else 'N/A'}")
         log_service.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
