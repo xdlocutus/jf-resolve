@@ -247,6 +247,8 @@ async def proxy_stream(session_id: str, request: Request):
     This hides the debrid service URL from Jellyfin.
     Supports multiple concurrent streams.
     """
+    log_service.info(f"[PROXY] Starting proxy for session {session_id}")
+    
     # Check concurrent stream limit
     global _active_streams
     async with _stream_lock:
@@ -265,9 +267,10 @@ async def proxy_stream(session_id: str, request: Request):
     log_service.info(f"Available sessions: {list(_stream_sessions.keys())[:5]}...")  # Show first 5
     
     # If not found locally, try to fetch from main server (for stream server)
-    if not session_data and settings.JFRESOLVE_SERVER_URL:
+    jfresolve_url = getattr(settings, 'JFRESOLVE_SERVER_URL', None)
+    if not session_data and jfresolve_url and isinstance(jfresolve_url, str):
         try:
-            main_server_url = settings.JFRESOLVE_SERVER_URL.rstrip("/")
+            main_server_url = jfresolve_url.rstrip("/")
             api_url = f"{main_server_url}/api/stream/get-stream-url/{session_id}?secret={_internal_api_secret}"
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(api_url)
