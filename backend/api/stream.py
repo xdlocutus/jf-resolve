@@ -9,7 +9,7 @@ from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
@@ -69,6 +69,7 @@ def cleanup_expired_sessions() -> int:
 
 @router.get("/resolve/{media_type}/{tmdb_id}")
 async def resolve_stream(
+    request: Request,
     media_type: str,
     tmdb_id: int,
     quality: str = Query("1080p"),
@@ -79,9 +80,10 @@ async def resolve_stream(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Resolve stream URL with failover
-    Returns 302 redirect to actual stream URL from Stremio manifest
+    Resolve stream URL with failover and stream directly (no redirect).
+    Returns 200/206 with stream body so Emby and other players work without following redirects.
     """
+    global _active_streams
     log_service.info(
         f"Stream resolve request: {media_type}/{tmdb_id} quality={quality} "
         f"index={index} imdb_id={imdb_id} season={season} episode={episode}"
@@ -95,13 +97,25 @@ async def resolve_stream(
             status_code=400, detail="Season and episode required for TV shows"
         )
 
-    # Reuse existing session for same media so Emby/Jellyfin range requests get the same proxy URL
+    # Reuse existing session for same media; stream directly (no redirect) so Emby/players get the stream
     session_id = generate_session_id(media_type, tmdb_id, quality, season, episode, index)
     existing = _stream_sessions.get(session_id)
     if existing and (datetime.utcnow().timestamp() - existing["created"]) < SESSION_TIMEOUT:
-        proxy_url = f"/api/stream/proxy/{session_id}"
-        log_service.info(f"Reusing proxy session {session_id} for {media_type}/{tmdb_id}")
-        return RedirectResponse(url=proxy_url, status_code=302)
+        stream_url = existing["url"]
+        log_service.info(f"Streaming from existing session {session_id} for {media_type}/{tmdb_id}")
+        async with _stream_lock:
+            if _active_streams >= MAX_CONCURRENT_STREAMS:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Server busy - max {MAX_CONCURRENT_STREAMS} concurrent streams allowed",
+                )
+            _active_streams += 1
+        try:
+            return await _build_stream_response(stream_url, request, session_id)
+        except Exception:
+            async with _stream_lock:
+                _active_streams -= 1
+            raise
 
     settings = SettingsManager(db)
     await settings.load_cache()
@@ -215,12 +229,21 @@ async def resolve_stream(
             cleaned = cleanup_expired_sessions()
             if cleaned > 0:
                 log_service.info(f"Cleaned up {cleaned} expired stream sessions")
-        
-        # Return proxy URL instead of direct redirect
-        proxy_url = f"/api/stream/proxy/{session_id}"
-        log_service.info(f"Created proxy session {session_id} -> {stream_url[:50]}...")
-        
-        return RedirectResponse(url=proxy_url, status_code=302)
+
+        log_service.info(f"Streaming from new session {session_id} -> {stream_url[:50]}...")
+        async with _stream_lock:
+            if _active_streams >= MAX_CONCURRENT_STREAMS:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Server busy - max {MAX_CONCURRENT_STREAMS} concurrent streams allowed",
+                )
+            _active_streams += 1
+        try:
+            return await _build_stream_response(stream_url, request, session_id)
+        except Exception:
+            async with _stream_lock:
+                _active_streams -= 1
+            raise
 
     except HTTPException:
         raise
@@ -233,6 +256,89 @@ async def resolve_stream(
         if tmdb:
             await tmdb.close()
         await stremio.close()
+
+
+async def _build_stream_response(
+    stream_url: str, request: Request, session_id: str
+) -> StreamingResponse:
+    """
+    Stream from upstream URL and return StreamingResponse.
+    Caller must increment _active_streams before calling; generator finally decrements when stream_started.
+    """
+    headers = {}
+    for key, value in request.headers.items():
+        if key.lower() == "host":
+            continue
+        if value is not None:
+            headers[key] = value if isinstance(value, str) else str(value)
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(3600.0),
+        follow_redirects=True,
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    ) as client:
+        meta = {
+            "content_type": "application/octet-stream",
+            "response_headers": {},
+            "status_code": 200,
+        }
+
+        async def content_generator():
+            global _active_streams
+            stream_started = False
+            try:
+                async with client.stream("GET", stream_url, headers=headers) as response:
+                    response.raise_for_status()
+                    meta["status_code"] = response.status_code
+                    meta["content_type"] = response.headers.get(
+                        "content-type", "application/octet-stream"
+                    )
+                    meta["response_headers"] = {
+                        k: v
+                        for k, v in response.headers.items()
+                        if k.lower() not in (
+                            "content-length",
+                            "transfer-encoding",
+                            "connection",
+                        )
+                    }
+                    if not any(
+                        k.lower() == "accept-ranges" for k in meta["response_headers"]
+                    ):
+                        meta["response_headers"]["Accept-Ranges"] = "bytes"
+                    try:
+                        async for chunk in response.aiter_bytes(chunk_size=8192):
+                            stream_started = True
+                            yield chunk
+                    except httpx.ReadError as e:
+                        log_service.error(f"Upstream read error while streaming: {e}")
+            finally:
+                if stream_started:
+                    async with _stream_lock:
+                        _active_streams -= 1
+                    log_service.info(
+                        f"Stream session {session_id} ended (active: {_active_streams})"
+                    )
+
+        gen = content_generator()
+        try:
+            first_chunk = await gen.__anext__()
+        except StopAsyncIteration:
+            first_chunk = b""
+            async with _stream_lock:
+                _active_streams -= 1
+
+        async def full_gen():
+            yield first_chunk
+            async for chunk in gen:
+                yield chunk
+
+        return StreamingResponse(
+            full_gen(),
+            media_type=meta["content_type"],
+            headers=meta["response_headers"],
+            status_code=meta["status_code"],
+        )
 
 
 @router.get("/get-stream-url/{session_id}")
@@ -319,94 +425,9 @@ async def proxy_stream(session_id: str, request: Request):
     
     log_service.info(f"Proxying stream for session {session_id} (active: {_active_streams})")
     log_service.stream(f"Proxying: {stream_url[:80]}...")
-    
+
     try:
-        # Forward request headers (except host) so Range is sent for seek; all traffic via your network
-        headers = {}
-        for key, value in request.headers.items():
-            if key.lower() == "host":
-                continue
-            if value is not None:
-                headers[key] = value if isinstance(value, str) else str(value)
-        
-        log_service.info(f"Fetching stream from: {stream_url[:100]}...")
-        
-        # Use streaming HTTP client (httpx uses .stream(), not get(stream=True))
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(3600.0),  # 1 hour timeout for large files
-            follow_redirects=True,
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
-        ) as client:
-            meta = {
-                "content_type": "application/octet-stream",
-                "response_headers": {},
-                "status_code": 200,
-            }
-
-            async def content_generator():
-                global _active_streams
-                stream_started = False
-                try:
-                    async with client.stream("GET", stream_url, headers=headers) as response:
-                        response.raise_for_status()
-                        meta["status_code"] = response.status_code
-                        meta["content_type"] = response.headers.get(
-                            "content-type", "application/octet-stream"
-                        )
-                        # Pass through Content-Range for 206 (seek); omit length/encoding/connection
-                        meta["response_headers"] = {
-                            k: v
-                            for k, v in response.headers.items()
-                            if k.lower() not in (
-                                "content-length",
-                                "transfer-encoding",
-                                "connection",
-                            )
-                        }
-                        if not any(k.lower() == "accept-ranges" for k in meta["response_headers"]):
-                            meta["response_headers"]["Accept-Ranges"] = "bytes"
-                        content_length = response.headers.get("content-length")
-                        log_service.info(
-                            f"Proxy stream started: {meta['content_type']}, length: {content_length}"
-                        )
-                        try:
-                            async for chunk in response.aiter_bytes(chunk_size=8192):
-                                stream_started = True
-                                yield chunk
-                        except httpx.ReadError as e:
-                            log_service.error(f"Upstream read error while streaming: {e}")
-                finally:
-                    # Don't delete session here - Jellyfin often opens a second request
-                    # (e.g. range or retry) to the same proxy URL; session expires via
-                    # SESSION_TIMEOUT / cleanup_expired_sessions() instead.
-                    if stream_started:
-                        async with _stream_lock:
-                            _active_streams -= 1
-                        log_service.info(
-                            f"Stream session {session_id} ended (active: {_active_streams})"
-                        )
-
-            # Advance generator once to open the stream and fill meta
-            gen = content_generator()
-            try:
-                first_chunk = await gen.__anext__()
-            except StopAsyncIteration:
-                first_chunk = b""  # empty stream; meta already set by generator
-                async with _stream_lock:
-                    _active_streams -= 1
-
-            async def full_gen():
-                yield first_chunk
-                async for chunk in gen:
-                    yield chunk
-
-            return StreamingResponse(
-                full_gen(),
-                media_type=meta["content_type"],
-                headers=meta["response_headers"],
-                status_code=meta["status_code"],
-            )
-            
+        return await _build_stream_response(stream_url, request, session_id)
     except httpx.HTTPError as e:
         async with _stream_lock:
             _active_streams -= 1
