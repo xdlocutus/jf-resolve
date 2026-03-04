@@ -324,7 +324,11 @@ async def proxy_stream(session_id: str, request: Request):
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
         ) as client:
             # Mutable container for headers (filled when generator starts streaming)
-            meta = {"content_type": "application/octet-stream", "response_headers": {}}
+            meta = {
+                "content_type": "application/octet-stream",
+                "response_headers": {},
+                "status_code": 200,
+            }
 
             async def content_generator():
                 global _active_streams
@@ -332,6 +336,7 @@ async def proxy_stream(session_id: str, request: Request):
                 try:
                     async with client.stream("GET", stream_url, headers=headers) as response:
                         response.raise_for_status()
+                        meta["status_code"] = response.status_code
                         meta["content_type"] = response.headers.get(
                             "content-type", "application/octet-stream"
                         )
@@ -344,6 +349,9 @@ async def proxy_stream(session_id: str, request: Request):
                                 "connection",
                             )
                         }
+                        # Let players (VLC, Jellyfin) know we support range requests
+                        if not any(k.lower() == "accept-ranges" for k in meta["response_headers"]):
+                            meta["response_headers"]["Accept-Ranges"] = "bytes"
                         content_length = response.headers.get("content-length")
                         log_service.info(
                             f"Proxy stream started: {meta['content_type']}, length: {content_length}"
@@ -383,6 +391,7 @@ async def proxy_stream(session_id: str, request: Request):
                 full_gen(),
                 media_type=meta["content_type"],
                 headers=meta["response_headers"],
+                status_code=meta["status_code"],
             )
             
     except httpx.HTTPError as e:
