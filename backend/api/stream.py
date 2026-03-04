@@ -18,6 +18,7 @@ from ..services.log_service import log_service
 from ..services.settings_manager import SettingsManager
 from ..services.stremio_service import StremioService
 from ..services.tmdb_service import TMDBService
+from ..config import settings
 
 router = APIRouter(prefix="/api/stream", tags=["stream"])
 
@@ -34,6 +35,9 @@ MAX_CONCURRENT_STREAMS = 10
 # Track active stream count
 _active_streams = 0
 _stream_lock = asyncio.Lock()
+
+# Shared secret for internal API calls between servers
+_internal_api_secret = settings.INTERNAL_API_SECRET
 
 
 def generate_session_id(media_type: str, tmdb_id: int, quality: str, season: int = None, episode: int = None) -> str:
@@ -214,6 +218,26 @@ async def resolve_stream(
         await stremio.close()
 
 
+@router.get("/get-stream-url/{session_id}")
+async def get_stream_url(session_id: str, secret: str = Query(...)):
+    """
+    Internal API to get stream URL by session ID.
+    Used by stream server to fetch resolved stream URLs from main server.
+    """
+    if secret != _internal_api_secret:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+    
+    session_data = _stream_sessions.get(session_id)
+    
+    if not session_data:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    return {
+        "url": session_data["url"],
+        "created": session_data["created"]
+    }
+
+
 @router.get("/proxy/{session_id}")
 async def proxy_stream(session_id: str, request: Request):
     """
@@ -232,8 +256,23 @@ async def proxy_stream(session_id: str, request: Request):
             )
         _active_streams += 1
     
-    # Look up the stored stream URL
+    # Try to get session from local storage first
     session_data = _stream_sessions.get(session_id)
+    
+    # If not found locally, try to fetch from main server (for stream server)
+    if not session_data and settings.JFRESOLVE_SERVER_URL:
+        try:
+            main_server_url = settings.JFRESOLVE_SERVER_URL.rstrip("/")
+            api_url = f"{main_server_url}/api/stream/get-stream-url/{session_id}?secret={_internal_api_secret}"
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(api_url)
+                if resp.status_code == 200:
+                    session_data = resp.json()
+                    log_service.info(f"Fetched stream URL from main server for session {session_id}")
+                else:
+                    log_service.error(f"Failed to fetch stream URL: {resp.status_code}")
+        except Exception as e:
+            log_service.error(f"Error fetching stream URL from main server: {e}")
     
     if not session_data:
         async with _stream_lock:

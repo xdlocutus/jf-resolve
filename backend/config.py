@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     JFRESOLVE_SERVER_URL: Optional[str] = None  # JF-Resolve server URL for STRM files
     STREAM_SERVER_URL: Optional[str] = None  # Explicit override for streaming server (port 8766)
     ALLOWED_ORIGINS: Optional[str] = None  # Comma-separated origins for main API
+    INTERNAL_API_SECRET: str = "jf-resolve-internal-2024"  # Secret for inter-server communication
 
     class Config:
         env_file = ".env"
