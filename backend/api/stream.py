@@ -258,27 +258,17 @@ async def resolve_stream(
         await stremio.close()
 
 
-def _is_initial_range_request(request: Request) -> bool:
-    """True if no Range or Range: bytes=0- (start from beginning). Emby expects 200 OK for this."""
-    range_val = request.headers.get("range") or ""
-    range_val = range_val.strip().lower()
-    if not range_val:
-        return True
-    if range_val == "bytes=0-" or range_val.startswith("bytes=0-,"):
-        return True
-    return False
-
-
 async def _build_stream_response(
     stream_url: str, request: Request, session_id: str
 ) -> StreamingResponse:
     """
     Stream from upstream URL and return StreamingResponse.
     Caller must increment _active_streams before calling; generator finally decrements when stream_started.
+    Always 200 OK, no Range forwarded - full stream from start for maximum Emby/player compatibility.
     """
     headers = {}
     for key, value in request.headers.items():
-        if key.lower() == "host":
+        if key.lower() in ("host", "range"):
             continue
         if value is not None:
             headers[key] = value if isinstance(value, str) else str(value)
@@ -291,7 +281,6 @@ async def _build_stream_response(
         meta = {
             "content_type": "application/octet-stream",
             "response_headers": {},
-            "status_code": 200,
         }
 
         async def content_generator():
@@ -300,10 +289,6 @@ async def _build_stream_response(
             try:
                 async with client.stream("GET", stream_url, headers=headers) as response:
                     response.raise_for_status()
-                    meta["status_code"] = response.status_code
-                    # Emby needs 200 OK for initial request (no Range or bytes=0-), not 206
-                    if _is_initial_range_request(request):
-                        meta["status_code"] = 200
                     meta["content_type"] = response.headers.get(
                         "content-type", "application/octet-stream"
                     )
@@ -314,14 +299,9 @@ async def _build_stream_response(
                             "content-length",
                             "transfer-encoding",
                             "connection",
+                            "content-range",
                         )
                     }
-                    if meta["status_code"] == 200:
-                        meta["response_headers"] = {
-                            k: v
-                            for k, v in meta["response_headers"].items()
-                            if k.lower() != "content-range"
-                        }
                     if not any(
                         k.lower() == "accept-ranges" for k in meta["response_headers"]
                     ):
@@ -357,7 +337,7 @@ async def _build_stream_response(
             full_gen(),
             media_type=meta["content_type"],
             headers=meta["response_headers"],
-            status_code=meta["status_code"],
+            status_code=200,
         )
 
 
