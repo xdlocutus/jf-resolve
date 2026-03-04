@@ -10,7 +10,7 @@ from typing import Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
@@ -126,7 +126,26 @@ def cleanup_expired_sessions() -> int:
     return len(expired)
 
 
+def _head_response_for_session(session_id: str) -> Response:
+    """Return 200 with stream headers for HEAD requests (Emby probe)."""
+    if _is_cache_complete(session_id):
+        size, content_type = _read_cache_meta(session_id)
+        return Response(
+            status_code=200,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Content-Type": content_type,
+                "Content-Length": str(size),
+            },
+        )
+    return Response(
+        status_code=200,
+        headers={"Accept-Ranges": "bytes", "Content-Type": "application/octet-stream"},
+    )
+
+
 @router.get("/resolve/{media_type}/{tmdb_id}")
+@router.head("/resolve/{media_type}/{tmdb_id}")
 async def resolve_stream(
     request: Request,
     media_type: str,
@@ -143,10 +162,6 @@ async def resolve_stream(
     Returns 200/206 with stream body so Emby and other players work without following redirects.
     """
     global _active_streams
-    log_service.info(
-        f"Stream resolve request: {media_type}/{tmdb_id} quality={quality} "
-        f"index={index} imdb_id={imdb_id} season={season} episode={episode}"
-    )
 
     if media_type not in ["movie", "tv"]:
         raise HTTPException(status_code=400, detail="Invalid media type")
@@ -157,6 +172,14 @@ async def resolve_stream(
         )
 
     session_id = generate_session_id(media_type, tmdb_id, quality, season, episode, index)
+
+    if request.method == "HEAD":
+        return _head_response_for_session(session_id)
+
+    log_service.info(
+        f"Stream resolve request: {media_type}/{tmdb_id} quality={quality} "
+        f"index={index} imdb_id={imdb_id} season={season} episode={episode}"
+    )
 
     # 1) Serve from cache if complete (supports Range/seek; Emby-friendly)
     cached = _serve_from_cache(session_id)
@@ -465,11 +488,15 @@ async def get_stream_url(session_id: str, secret: str = Query(...)):
 
 
 @router.get("/proxy/{session_id}")
+@router.head("/proxy/{session_id}")
 async def proxy_stream(session_id: str, request: Request):
     """
     Proxy endpoint that fetches the stream from debrid and forwards it to Jellyfin.
     Serves from local cache when available (supports Range/seek).
     """
+    if request.method == "HEAD":
+        return _head_response_for_session(session_id)
+
     log_service.info(f"[PROXY] Starting proxy for session {session_id}")
 
     cached = _serve_from_cache(session_id)
