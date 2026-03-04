@@ -2,6 +2,8 @@
 
 import asyncio
 import hashlib
+import sys
+import traceback
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -315,58 +317,83 @@ async def proxy_stream(session_id: str, request: Request):
         
         log_service.info(f"Fetching stream from: {stream_url[:100]}...")
         
-        # Use streaming HTTP client to fetch and forward content
+        # Use streaming HTTP client (httpx uses .stream(), not get(stream=True))
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(3600.0),  # 1 hour timeout for large files
             follow_redirects=True,
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
         ) as client:
-            # Make request to get headers first
-            response = await client.get(stream_url, headers=headers, stream=True)
-            
-            # Get content type and other headers from upstream
-            content_type = response.headers.get("content-type", "application/octet-stream")
-            content_length = response.headers.get("content-length")
-            
-            log_service.info(f"Proxy stream started: {content_type}, length: {content_length}")
-            
-            # Stream the content back to the client
+            # Mutable container for headers (filled when generator starts streaming)
+            meta = {"content_type": "application/octet-stream", "response_headers": {}}
+
             async def content_generator():
+                stream_started = False
                 try:
-                    async for chunk in response.aiter_bytes(chunk_size=8192):
-                        yield chunk
+                    async with client.stream("GET", stream_url, headers=headers) as response:
+                        response.raise_for_status()
+                        meta["content_type"] = response.headers.get(
+                            "content-type", "application/octet-stream"
+                        )
+                        meta["response_headers"] = {
+                            k: v
+                            for k, v in response.headers.items()
+                            if k.lower() not in (
+                                "content-length",
+                                "transfer-encoding",
+                                "connection",
+                            )
+                        }
+                        content_length = response.headers.get("content-length")
+                        log_service.info(
+                            f"Proxy stream started: {meta['content_type']}, length: {content_length}"
+                        )
+                        async for chunk in response.aiter_bytes(chunk_size=8192):
+                            stream_started = True
+                            yield chunk
                 finally:
-                    # Clean up session after streaming completes
                     if session_id in _stream_sessions:
                         del _stream_sessions[session_id]
-                    async with _stream_lock:
-                        _active_streams -= 1
-                    log_service.info(f"Stream session {session_id} ended (active: {_active_streams})")
-            
-            # Filter headers - exclude content-length for streaming
-            response_headers = {}
-            for key, value in response.headers.items():
-                if key.lower() not in ("content-length", "transfer-encoding", "connection"):
-                    response_headers[key] = value
-            
+                    if stream_started:
+                        async with _stream_lock:
+                            _active_streams -= 1
+                        log_service.info(
+                            f"Stream session {session_id} ended (active: {_active_streams})"
+                        )
+
+            # Advance generator once to open the stream and fill meta
+            gen = content_generator()
+            try:
+                first_chunk = await gen.__anext__()
+            except StopAsyncIteration:
+                first_chunk = b""  # empty stream; meta already set by generator
+                async with _stream_lock:
+                    _active_streams -= 1
+
+            async def full_gen():
+                yield first_chunk
+                async for chunk in gen:
+                    yield chunk
+
             return StreamingResponse(
-                content_generator(),
-                media_type=content_type,
-                headers=response_headers
+                full_gen(),
+                media_type=meta["content_type"],
+                headers=meta["response_headers"],
             )
             
     except httpx.HTTPError as e:
         async with _stream_lock:
             _active_streams -= 1
-        log_service.error(f"HTTP error proxying stream: {e}")
-        import traceback
+        msg = f"HTTP error proxying stream: {e}"
+        log_service.error(msg)
         log_service.error(traceback.format_exc())
+        print(f"[PROXY ERROR] {msg}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
         raise HTTPException(status_code=502, detail=f"Failed to fetch stream: {str(e)}")
     except Exception as e:
         async with _stream_lock:
             _active_streams -= 1
-        import traceback
-        log_service.error(f"Error proxying stream: {type(e).__name__}: {e}")
+        msg = f"Error proxying stream: {type(e).__name__}: {e}"
+        log_service.error(msg)
         log_service.error(f"Stream URL (first 120 chars): {stream_url[:120] if stream_url else 'N/A'}")
         log_service.error(traceback.format_exc())
+        print(f"[PROXY ERROR] {msg}\nStream URL: {stream_url[:120] if stream_url else 'N/A'}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
         raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
