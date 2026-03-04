@@ -355,8 +355,9 @@ async def proxy_stream(session_id: str, request: Request):
                         except httpx.ReadError as e:
                             log_service.error(f"Upstream read error while streaming: {e}")
                 finally:
-                    if session_id in _stream_sessions:
-                        del _stream_sessions[session_id]
+                    # Don't delete session here - Jellyfin often opens a second request
+                    # (e.g. range or retry) to the same proxy URL; session expires via
+                    # SESSION_TIMEOUT / cleanup_expired_sessions() instead.
                     if stream_started:
                         async with _stream_lock:
                             _active_streams -= 1
