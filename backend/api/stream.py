@@ -6,10 +6,13 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
+import httpx
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..config import settings
 from ..database import get_db
 from ..services.failover_manager import FailoverManager
 from ..services.library_service import LibraryService
@@ -35,7 +38,8 @@ _active_streams = 0
 _stream_lock = asyncio.Lock()
 
 # Shared secret for internal API calls between servers
-_internal_api_secret = settings.INTERNAL_API_SECRET
+# Use getattr to avoid issues at import time
+_internal_api_secret = getattr(settings, 'INTERNAL_API_SECRET', 'jf-resolve-internal-2024')
 
 
 def generate_session_id(media_type: str, tmdb_id: int, quality: str, season: int = None, episode: int = None) -> str:
