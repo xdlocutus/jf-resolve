@@ -327,6 +327,7 @@ async def proxy_stream(session_id: str, request: Request):
             meta = {"content_type": "application/octet-stream", "response_headers": {}}
 
             async def content_generator():
+                global _active_streams
                 stream_started = False
                 try:
                     async with client.stream("GET", stream_url, headers=headers) as response:
@@ -347,9 +348,12 @@ async def proxy_stream(session_id: str, request: Request):
                         log_service.info(
                             f"Proxy stream started: {meta['content_type']}, length: {content_length}"
                         )
-                        async for chunk in response.aiter_bytes(chunk_size=8192):
-                            stream_started = True
-                            yield chunk
+                        try:
+                            async for chunk in response.aiter_bytes(chunk_size=8192):
+                                stream_started = True
+                                yield chunk
+                        except httpx.ReadError as e:
+                            log_service.error(f"Upstream read error while streaming: {e}")
                 finally:
                     if session_id in _stream_sessions:
                         del _stream_sessions[session_id]
