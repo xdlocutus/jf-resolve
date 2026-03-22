@@ -84,64 +84,18 @@ def cleanup_expired_sessions() -> int:
     return len(expired)
 
 
-@router.get("/resolve/{media_type}/{tmdb_id}")
-@router.head("/resolve/{media_type}/{tmdb_id}")
-async def resolve_stream(
-    request: Request,
+async def _select_stream_url(
+    db: AsyncSession,
     media_type: str,
     tmdb_id: int,
-    quality: str = Query("1080p"),
-    season: Optional[int] = Query(None),
-    episode: Optional[int] = Query(None),
-    index: int = Query(0),
-    imdb_id: Optional[str] = Query(None),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Resolve stream URL with failover and stream directly (no redirect).
-    Returns 200/206 with stream body so Emby and other players work without following redirects.
-    """
-    global _active_streams
-
-    if media_type not in ["movie", "tv"]:
-        raise HTTPException(status_code=400, detail="Invalid media type")
-
-    if media_type == "tv" and (season is None or episode is None):
-        raise HTTPException(
-            status_code=400, detail="Season and episode required for TV shows"
-        )
-
-    session_id = generate_session_id(media_type, tmdb_id, quality, season, episode, index)
-    existing = _stream_sessions.get(session_id)
-    if existing and (datetime.utcnow().timestamp() - existing["created"]) < SESSION_TIMEOUT:
-        stream_url = existing["url"]
-        if request.method == "HEAD":
-            return await _proxy_head(stream_url, request)
-        log_service.info(f"Proxying from session {session_id} for {media_type}/{tmdb_id}")
-        async with _stream_lock:
-            if _active_streams >= MAX_CONCURRENT_STREAMS:
-                raise HTTPException(status_code=503, detail=f"Server busy - max {MAX_CONCURRENT_STREAMS} concurrent streams")
-            _active_streams += 1
-        try:
-            return await _build_stream_response(stream_url, request, session_id)
-        except HTTPException:
-            async with _stream_lock:
-                _active_streams -= 1
-            raise
-        except Exception as e:
-            async with _stream_lock:
-                _active_streams -= 1
-            log_service.error(f"Stream proxy error: {e}")
-            raise HTTPException(status_code=502, detail=f"Stream error: {str(e)}")
-
-    if request.method == "HEAD":
-        return Response(status_code=200, headers={"Accept-Ranges": "bytes", "Content-Type": "application/octet-stream"})
-
-    log_service.info(
-        f"Stream resolve request: {media_type}/{tmdb_id} quality={quality} "
-        f"index={index} imdb_id={imdb_id} season={season} episode={episode}"
-    )
-
+    quality: str,
+    season: Optional[int],
+    episode: Optional[int],
+    index: int,
+    imdb_id: Optional[str],
+    advance_failover: bool,
+) -> str:
+    """Resolve the upstream stream URL and optionally advance failover state."""
     settings = SettingsManager(db)
     await settings.load_cache()
 
@@ -155,7 +109,6 @@ async def resolve_stream(
         )
 
     stremio = StremioService(manifest_url)
-
     failover = FailoverManager(db)
 
     try:
@@ -164,27 +117,30 @@ async def resolve_stream(
         else:
             state_key = f"tv:{tmdb_id}:{season}:{episode}"
 
-        grace_seconds = await settings.get("failover_grace_seconds", 45)
-        reset_seconds = await settings.get("failover_window_seconds", 120)
-
         state = await failover.get_state(state_key)
+        use_index = index
 
-        should_increment, use_index = failover.should_failover(
-            state, grace_seconds, reset_seconds
-        )
+        if advance_failover:
+            grace_seconds = await settings.get("failover_grace_seconds", 45)
+            reset_seconds = await settings.get("failover_window_seconds", 120)
+            should_increment, use_index = failover.should_failover(
+                state, grace_seconds, reset_seconds
+            )
 
-        now = datetime.utcnow()
-        if state.first_attempt is None:
-            state.first_attempt = now
-        state.last_attempt = now
+            now = datetime.utcnow()
+            if state.first_attempt is None:
+                state.first_attempt = now
+            state.last_attempt = now
 
-        if should_increment:
-            state.current_index = use_index
-            state.attempt_count += 1
+            if should_increment:
+                state.current_index = use_index
+                state.attempt_count += 1
+            else:
+                use_index = state.current_index
+
+            await failover.update_state(state)
         else:
-            use_index = state.current_index
-
-        await failover.update_state(state)
+            use_index = state.current_index if state else index
 
         if not imdb_id:
             if not api_key:
@@ -241,6 +197,80 @@ async def resolve_stream(
         log_service.stream(
             f"Resolved {state_key} quality={quality} index={use_index} attempt={state.attempt_count} → {stream_url[:100]}..."
         )
+        return stream_url
+    finally:
+        if tmdb:
+            await tmdb.close()
+        await stremio.close()
+
+
+@router.get("/resolve/{media_type}/{tmdb_id}")
+@router.head("/resolve/{media_type}/{tmdb_id}")
+async def resolve_stream(
+    request: Request,
+    media_type: str,
+    tmdb_id: int,
+    quality: str = Query("1080p"),
+    season: Optional[int] = Query(None),
+    episode: Optional[int] = Query(None),
+    index: int = Query(0),
+    imdb_id: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Resolve stream URL with failover and stream directly (no redirect).
+    Returns 200/206 with stream body so Emby and other players work without following redirects.
+    """
+    global _active_streams
+
+    if media_type not in ["movie", "tv"]:
+        raise HTTPException(status_code=400, detail="Invalid media type")
+
+    if media_type == "tv" and (season is None or episode is None):
+        raise HTTPException(
+            status_code=400, detail="Season and episode required for TV shows"
+        )
+
+    session_id = generate_session_id(media_type, tmdb_id, quality, season, episode, index)
+    existing = _stream_sessions.get(session_id)
+    if existing and (datetime.utcnow().timestamp() - existing["created"]) < SESSION_TIMEOUT:
+        stream_url = existing["url"]
+        if request.method == "HEAD":
+            return await _proxy_head(stream_url, request)
+        log_service.info(f"Proxying from session {session_id} for {media_type}/{tmdb_id}")
+        async with _stream_lock:
+            if _active_streams >= MAX_CONCURRENT_STREAMS:
+                raise HTTPException(status_code=503, detail=f"Server busy - max {MAX_CONCURRENT_STREAMS} concurrent streams")
+            _active_streams += 1
+        try:
+            return await _build_stream_response(stream_url, request, session_id)
+        except HTTPException:
+            async with _stream_lock:
+                _active_streams -= 1
+            raise
+        except Exception as e:
+            async with _stream_lock:
+                _active_streams -= 1
+            log_service.error(f"Stream proxy error: {e}")
+            raise HTTPException(status_code=502, detail=f"Stream error: {str(e)}")
+
+    log_service.info(
+        f"Stream resolve request: {media_type}/{tmdb_id} quality={quality} "
+        f"index={index} imdb_id={imdb_id} season={season} episode={episode}"
+    )
+
+    try:
+        stream_url = await _select_stream_url(
+            db=db,
+            media_type=media_type,
+            tmdb_id=tmdb_id,
+            quality=quality,
+            season=season,
+            episode=episode,
+            index=index,
+            imdb_id=imdb_id,
+            advance_failover=request.method != "HEAD",
+        )
 
         # Generate session ID and store stream URL for proxying (same id as early-check for reuse)
         session_id = generate_session_id(media_type, tmdb_id, quality, season, episode, index)
@@ -248,13 +278,15 @@ async def resolve_stream(
             "url": stream_url,
             "created": datetime.utcnow().timestamp()
         }
-        
+
         if len(_stream_sessions) > 100:
             cleaned = cleanup_expired_sessions()
             if cleaned > 0:
                 log_service.info(f"Cleaned up {cleaned} expired stream sessions")
 
         log_service.info(f"Proxying new session {session_id} -> {stream_url[:50]}...")
+        if request.method == "HEAD":
+            return await _proxy_head(stream_url, request)
         async with _stream_lock:
             if _active_streams >= MAX_CONCURRENT_STREAMS:
                 raise HTTPException(status_code=503, detail=f"Server busy - max {MAX_CONCURRENT_STREAMS} concurrent streams")
@@ -278,10 +310,6 @@ async def resolve_stream(
         raise HTTPException(
             status_code=500, detail=f"Failed to resolve stream: {str(e)}"
         )
-    finally:
-        if tmdb:
-            await tmdb.close()
-        await stremio.close()
 
 
 async def _build_stream_response(stream_url: str, request: Request, session_id: str) -> StreamingResponse:

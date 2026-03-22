@@ -112,11 +112,11 @@
                 <div class="form-control mt-2">
                     <label class="label">
                         <span class="label-text"
-                            >Streaming Server URL (Port 8766)</span
+                            >Streaming Proxy Override</span
                         >
                         <div
                             class="tooltip tooltip-left"
-                            data-tip="Using 127.0.0.1 or the local ip addressis recommended when Jellyfin and JF-Resolve are on the same machine."
+                            data-tip="Optional. Leave blank to have STRM files point at the main JF-Resolve app URL above. Set this only if you want Jellyfin to use a separate streaming service instead."
                         >
                             <span class="badge badge-sm badge-info cursor-help"
                                 >?</span
@@ -128,7 +128,7 @@
                             type="text"
                             x-model="settings.stream_server_url"
                             class="input input-bordered flex-1"
-                            placeholder="Default: http://127.0.0.1:8766"
+                            placeholder="Optional override, e.g. http://127.0.0.1:8766"
                         />
                         <button
                             @click="testStreamConnection()"
@@ -147,6 +147,9 @@
                         class="mt-2 text-xs space-y-1 p-2 bg-base-200 rounded-lg border border-white/5"
                         x-cloak
                     >
+                        <div class="text-info">
+                            Blank override = STRM files use the Main API URL above.
+                        </div>
                         <div class="flex items-center gap-2">
                             <span
                                 :class="testResults.localhost.status === 'ok' ? 'text-success' : 'text-error'"
