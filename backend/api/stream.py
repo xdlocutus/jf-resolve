@@ -337,7 +337,7 @@ async def _build_stream_response(stream_url: str, request: Request, session_id: 
                     meta["response_headers"] = {
                         k: v
                         for k, v in response.headers.items()
-                        if k.lower() not in ("content-length", "transfer-encoding", "connection")
+                        if k.lower() not in ("transfer-encoding", "connection")
                     }
                     if not any(k.lower() == "accept-ranges" for k in meta["response_headers"]):
                         meta["response_headers"]["Accept-Ranges"] = "bytes"
