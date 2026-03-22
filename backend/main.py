@@ -74,6 +74,7 @@ app.include_router(search.router)
 app.include_router(library.router)
 app.include_router(settings_api.router)
 app.include_router(system.router)
+app.include_router(stream.router)
 
 
 # Template routes

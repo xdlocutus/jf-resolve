@@ -5,7 +5,6 @@ import json
 import shutil
 from pathlib import Path
 from typing import Dict, List, Optional
-from urllib.parse import urlparse
 
 import httpx
 from sqlalchemy import select
@@ -27,18 +26,17 @@ class LibraryService:
 
     async def _get_stream_server_url(self) -> str:
         """
-        Get the stream server URL for STRM file generation.
+        Get the stream proxy URL for STRM file generation.
+        Prefer the main JF-Resolve app so STRM playback proxies through the
+        dashboard app, but still allow an explicit dedicated streaming override.
         """
         stream_url = await self.settings.get("stream_server_url")
         if stream_url:
             return stream_url.rstrip("/")
         resolve_url = await self.settings.get("jfresolve_server_url")
         if resolve_url:
-            parsed = urlparse(resolve_url)
-            scheme = parsed.scheme or "http"
-            hostname = parsed.hostname or "localhost"
-            return f"{scheme}://{hostname}:8766"
-        return "http://127.0.0.1:8766"
+            return resolve_url.rstrip("/")
+        return "http://127.0.0.1:8765"
 
     async def is_in_library(self, tmdb_id: int, media_type: str) -> bool:
         """Check if item is already in library"""
