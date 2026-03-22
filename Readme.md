@@ -227,10 +227,10 @@ You can view logs through the web interface or access them directly in the logs 
 
 ## System Architecture
 
-JF-Resolve runs two separate servers:
+JF-Resolve runs a main web app and can optionally run a dedicated streaming service:
 
-1. The main server on port 8765 handles the web interface, library management, and configuration
-2. The stream server on port 8766 handles stream resolution requests from Jellyfin
+1. The main server on port 8765 handles the web interface, library management, configuration, and built-in stream proxying for generated STRM files
+2. The optional stream server on port 8766 can still be used as a dedicated streaming endpoint if you explicitly configure a streaming override URL
 
 
 ## Disclaimer
